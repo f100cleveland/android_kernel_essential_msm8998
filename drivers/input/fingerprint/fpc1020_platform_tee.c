@@ -27,6 +27,7 @@
 #include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
+#include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -35,6 +36,11 @@
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/wakelock.h>
+
+#ifdef CONFIG_FB
+#include <linux/fb.h>
+#include <linux/notifier.h>
+#endif
 
 #define FPC_TTW_HOLD_TIME 1000
 
@@ -48,6 +54,8 @@
 #define PWR_ON_SLEEP_MAX_US (PWR_ON_SLEEP_MIN_US + 900)
 
 #define NUM_PARAMS_REG_ENABLE_SET 2
+
+#define KEY_FINGERPRINT 0x2ee
 
 static const char * const pctl_names[] = {
 	"fpc1020_reset_reset",
@@ -67,6 +75,11 @@ struct fpc1020_data {
 	struct mutex lock; /* To set/get exported values in sysfs */
 	bool prepared;
 	atomic_t wakeup_enabled; /* Used both in ISR and non-ISR */
+	int screen_state; // 1:on 0:off
+	#if defined(CONFIG_FB)
+		struct notifier_block fb_notif;
+	#endif
+	struct input_dev *input_dev;
 };
 
 /**
@@ -238,18 +251,91 @@ static ssize_t irq_ack(struct device *dev,
 }
 static DEVICE_ATTR(irq, S_IRUSR | S_IWUSR, irq_get, irq_ack);
 
+static ssize_t screen_state_get(struct device* device,
+				struct device_attribute* attribute,
+				char* buffer)
+{
+	struct fpc1020_data* fpc1020 = dev_get_drvdata(device);
+	return scnprintf(buffer, PAGE_SIZE, "%i\n", fpc1020->screen_state);
+}
+static DEVICE_ATTR(screen_state, S_IRUSR , screen_state_get, NULL);
+
 static struct attribute *attributes[] = {
 	&dev_attr_pinctl_set.attr,
 	&dev_attr_hw_reset.attr,
 	&dev_attr_wakeup_enable.attr,
 	&dev_attr_clk_enable.attr,
 	&dev_attr_irq.attr,
+	&dev_attr_screen_state.attr,
 	NULL
 };
 
 static const struct attribute_group attribute_group = {
 	.attrs = attributes,
 };
+
+ 
+int fpc1020_input_init(struct fpc1020_data *fpc1020)
+{
+	int error = 0;
+
+	dev_dbg(fpc1020->dev, "%s\n", __func__);
+
+	fpc1020->input_dev = input_allocate_device();
+
+	if (!fpc1020->input_dev) {
+		dev_err(fpc1020->dev, "Input_allocate_device failed.\n");
+		error  = -ENOMEM;
+	}
+
+	if (!error) {
+		fpc1020->input_dev->name = "fpc1020";
+
+		/* Set event bits according to what events we are generating */
+		set_bit(EV_KEY, fpc1020->input_dev->evbit);
+
+	set_bit(KEY_FINGERPRINT, fpc1020->input_dev->keybit);
+
+		/* Register the input device */
+		error = input_register_device(fpc1020->input_dev);
+
+		if (error) {
+			dev_err(fpc1020->dev, "Input_register_device failed.\n");
+			input_free_device(fpc1020->input_dev);
+			fpc1020->input_dev = NULL;
+		}
+	}
+
+	return error;
+}
+
+void fpc1020_input_destroy(struct fpc1020_data *fpc1020)
+{
+	dev_dbg(fpc1020->dev, "%s\n", __func__);
+
+	if (fpc1020->input_dev != NULL)
+		input_free_device(fpc1020->input_dev);
+}
+
+#if defined(CONFIG_FB)
+static int fb_notifier_callback(struct notifier_block *self, unsigned long event, void *data)
+{
+	struct fpc1020_data *fpc1020 = container_of(self, struct fpc1020_data, fb_notif);
+	struct fb_event *evdata = data;
+	int *blank = evdata->data;
+
+	if (event != FB_EARLY_EVENT_BLANK)
+		return 0;
+
+	if (*blank == FB_BLANK_UNBLANK) {
+		fpc1020->screen_state = 1;
+	} else if (*blank == FB_BLANK_POWERDOWN) {
+		fpc1020->screen_state = 0;
+	}
+
+	return 0;
+}
+#endif
 
 static irqreturn_t fpc1020_irq_handler(int irq, void *handle)
 {
@@ -263,6 +349,14 @@ static irqreturn_t fpc1020_irq_handler(int irq, void *handle)
 	}
 
 	sysfs_notify(&fpc1020->dev->kobj, NULL, dev_attr_irq.attr.name);
+	sysfs_notify(&fpc1020->dev->kobj, NULL, dev_attr_screen_state.attr.name);
+
+	if (!fpc1020->screen_state) {
+		input_report_key(fpc1020->input_dev, KEY_FINGERPRINT, 1);
+		input_sync(fpc1020->input_dev);
+		input_report_key(fpc1020->input_dev, KEY_FINGERPRINT, 0);
+		input_sync(fpc1020->input_dev);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -360,6 +454,10 @@ static int fpc1020_probe(struct platform_device *pdev)
 
 	atomic_set(&fpc1020->wakeup_enabled, 0);
 
+	rc = fpc1020_input_init(fpc1020);
+	if (rc)
+		goto exit;
+
 	irqf = IRQF_TRIGGER_RISING | IRQF_ONESHOT;
 	if (of_property_read_bool(dev->of_node, "fpc,enable-wakeup")) {
 		irqf |= IRQF_NO_SUSPEND;
@@ -392,6 +490,14 @@ static int fpc1020_probe(struct platform_device *pdev)
 	rc = hw_reset(fpc1020);
 
 	dev_info(dev, "%s: ok\n", __func__);
+
+	#if defined(CONFIG_FB)
+		fpc1020->fb_notif.notifier_call = fb_notifier_callback;
+		rc = fb_register_client(&fpc1020->fb_notif);
+		if(rc)
+			dev_err(fpc1020->dev, "Unable to register fb_notifier: %d\n", rc);
+		fpc1020->screen_state = 1;
+	#endif
 
 exit:
 	return rc;
