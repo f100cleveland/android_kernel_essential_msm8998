@@ -35,6 +35,7 @@
 #include <linux/of.h>
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
+#include <linux/sched.h>
 #include <linux/wakelock.h>
 
 #ifdef CONFIG_FB
@@ -81,6 +82,20 @@ struct fpc1020_data {
 	#endif
 	struct input_dev *input_dev;
 };
+
+static void set_fingerprintd_nice(int nice)
+{
+	struct task_struct *p;
+
+	read_lock(&tasklist_lock);
+	for_each_process(p) {
+		if (!memcmp(p->comm, "fingerprintd", 13)) {
+			set_user_nice(p, nice);
+			break;
+		}
+	}
+	read_unlock(&tasklist_lock);
+}
 
 /**
  * sysfs node for controlling clocks.
@@ -332,6 +347,16 @@ static int fb_notifier_callback(struct notifier_block *self, unsigned long event
 	} else if (*blank == FB_BLANK_POWERDOWN) {
 		fpc1020->screen_state = 0;
 	}
+
+	/*
+	 * Elevate fingerprintd priority when screen is off to ensure
+	 * the fingerprint sensor is responsive and that the haptic
+	 * response on successful verification always fires.
+	 */
+	if (fpc1020->screen_state)
+		set_fingerprintd_nice(0);
+	else
+		set_fingerprintd_nice(-1);
 
 	return 0;
 }
