@@ -649,7 +649,7 @@
 
 &pmi8998_haptics {
 	status = "okay";
-	qcom,wave-play-rate-us = <5000>;
+	qcom,wave-play-rate-us = <5500>;
 	qcom,wave-shape = "sine";
 	qcom,play-mode = "buffer";
 	qcom,vmax-mv = <2750>;
